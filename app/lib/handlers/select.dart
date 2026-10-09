@@ -12,6 +12,11 @@ class SelectHandler extends Handler<SelectTool> {
 
   SelectHandler(super.data);
 
+  /// Read-only snapshot for the MathInk embed bridge. Keeping the renderer list
+  /// private prevents a host from modifying the selection behind the tool.
+  List<Renderer<PadElement>> get selectedRenderers =>
+      List.unmodifiable(_selected);
+
   void transform(
     DocumentBloc bloc,
     SelectionTransformCorner? corner, {

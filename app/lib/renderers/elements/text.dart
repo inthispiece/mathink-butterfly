@@ -42,7 +42,7 @@ abstract class GenericTextRenderer<T extends LabelElement> extends Renderer<T> {
           null,
           element.foreground,
           styleSheet?.fontFamily ?? kDefaultFontFamily,
-          styleSheet?.fontFamilyFallback ?? const [],
+          [...?styleSheet?.fontFamilyFallback, 'Noto Sans SC'],
         ),
       ),
     };
@@ -61,14 +61,12 @@ abstract class GenericTextRenderer<T extends LabelElement> extends Renderer<T> {
     text.DefinedParagraphProperty? parent,
   ]) {
     final styleSheet = _getStyle();
-    final style = styleSheet
-        .resolveSpanProperty(span.property)
-        ?.toFlutter(
-          parent,
-          element.foreground,
-          styleSheet?.fontFamily ?? kDefaultFontFamily,
-          styleSheet?.fontFamilyFallback ?? const [],
-        );
+    final style = styleSheet.resolveSpanProperty(span.property)?.toFlutter(
+      parent,
+      element.foreground,
+      styleSheet?.fontFamily ?? kDefaultFontFamily,
+      [...?styleSheet?.fontFamilyFallback, 'Noto Sans SC'],
+    );
     switch (span) {
       case text.TextSpan():
         return TextSpan(text: span.text, style: style);

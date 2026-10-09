@@ -11,6 +11,7 @@ import 'package:go_router/go_router.dart';
 
 import 'action.dart';
 import 'embedding.dart';
+import 'mathink.dart';
 
 class EmbedHandler {
   EmbedHandler();
@@ -21,6 +22,7 @@ class EmbedHandler {
       renderSVGListener;
   StreamSubscription? _blocSubscription;
   Timer? _changeDebounceTimer;
+  MathInkEmbedBridge? _mathInkBridge;
 
   Map<String, dynamic>? _messageToMap(Object? message) {
     if (message is Map<String, dynamic>) return message;
@@ -116,6 +118,7 @@ class EmbedHandler {
   }
 
   void register(BuildContext context, DocumentBloc bloc) {
+    _mathInkBridge ??= MathInkEmbedBridge(context, bloc)..register();
     _blocSubscription ??= bloc.stream.listen((state) {
       if (state is DocumentLoadSuccess &&
           bloc.editorController.saveCubit.state.saved == .unsaved) {
@@ -268,6 +271,8 @@ class EmbedHandler {
   }
 
   void unregister() {
+    _mathInkBridge?.unregister();
+    _mathInkBridge = null;
     _blocSubscription?.cancel();
     _blocSubscription = null;
     _changeDebounceTimer?.cancel();

@@ -39,5 +39,8 @@ void setupLicenses() {
     yield LicenseEntryWithLineBreaks([
       'Noto Sans Arabic',
     ], await rootBundle.loadString('fonts/NotoSansArabic-LICENSE.txt'));
+    yield LicenseEntryWithLineBreaks([
+      'Noto Sans SC',
+    ], await rootBundle.loadString('fonts/NotoSansSC-LICENSE.txt'));
   });
 }

@@ -13,7 +13,6 @@ import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_bloc/flutter_bloc.dart';
 import 'package:butterfly/src/generated/i18n/app_localizations.dart';
-import 'package:flutter_web_plugins/url_strategy.dart';
 import 'package:go_router/go_router.dart';
 import 'package:lw_file_system/lw_file_system.dart';
 import 'package:lw_sysapi/lw_sysapi.dart';
@@ -44,7 +43,8 @@ Future<void> main([List<String> args = const []]) async {
   initLogger();
   await rotatePersistedLogs();
   talker.info('App started');
-  usePathUrlStrategy();
+  // Hash routes also work inside SiYuan's static plugin/resource server,
+  // which cannot rewrite /embed to index.html.
 
   final prefs = await SharedPreferences.getInstance();
   final settingsCubit = SettingsCubit(prefs);

@@ -8,6 +8,7 @@ const kDefaultFontFamily = 'Roboto';
 const kBundledFontFamilies = {
   'Comfortaa',
   'Noto Sans Arabic',
+  'Noto Sans SC',
   kDefaultFontFamily,
 };
 

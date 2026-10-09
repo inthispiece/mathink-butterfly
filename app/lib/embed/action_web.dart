@@ -41,6 +41,14 @@ EventListener onEmbedMessage(String type, EmbedMessageHandler callback) {
     if (event.isA<html.MessageEvent>()) {
       final messageEvent = event as html.MessageEvent;
       if (event.type == 'message' && messageEvent.source == null) return;
+      // MathInk bundles the editor on the host's origin. Do not let unrelated
+      // windows export private strokes or mutate the document through its API.
+      if (type == 'mathink' &&
+          event.type == 'message' &&
+          (messageEvent.source != html.window.parent ||
+              messageEvent.origin != html.window.location.origin)) {
+        return;
+      }
       final data = messageEvent.data;
       if (data.isA<JSObject>()) {
         final objectData = data as JSObject;

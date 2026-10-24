@@ -56,6 +56,21 @@ String mathInkRevision(DocumentPage page) => sha256
     )
     .toString();
 
+/// Whole-page transcription also depends on text, images and layout.
+/// Keep the ink-only revision above stable for existing formula links.
+String mathInkPageRevision(DocumentPage page) =>
+    sha256.convert(utf8.encode(jsonEncode(page.toJson()))).toString();
+
+List<Renderer<PadElement>> mathInkPageRenderers(
+  Iterable<Renderer<PadElement>> renderers,
+) {
+  final all = renderers.toList();
+  if (all.any((renderer) => renderer.expandedRect == null)) {
+    throw const FormatException('PAGE_CONTENT_NOT_READY');
+  }
+  return all;
+}
+
 /// Correlated host requests. A PNG is rendered from selected pen renderers,
 /// never by cropping a screenshot which could include unrelated handwriting.
 class MathInkEmbedBridge {
@@ -131,6 +146,65 @@ class MathInkEmbedBridge {
       throw const FormatException('DOCUMENT_NOT_READY');
     }
     switch (method) {
+      case 'renderPage':
+        final expectedPage = payload['page'];
+        if (expectedPage != null && expectedPage != state.pageName) {
+          throw const FormatException('SOURCE_PAGE_CHANGED');
+        }
+        final revision = mathInkPageRevision(state.page);
+        final all = mathInkPageRenderers(
+          bloc.editorController.rendererCubit.renderers.where(
+            (renderer) => !state.invisibleLayers.contains(renderer.layer),
+          ),
+        );
+        final bounds = _bounds(all);
+        final options = mathInkImageOptions(bounds);
+        final png = await bloc.editorController.rendererCubit.render(
+          bloc.editorController,
+          state.data,
+          state.page,
+          state.info,
+          options,
+          cameraViewport: CameraViewport.unbaked(
+            unbakedElements: all,
+            visibleElements: all,
+            visibleUnbakedElements: all,
+          ),
+          docState: state,
+          invisibleLayers: state.invisibleLayers,
+        );
+        final current = bloc.state;
+        if (current is! DocumentLoadSuccess ||
+            current.pageName != state.pageName ||
+            mathInkPageRevision(current.page) != revision) {
+          throw const FormatException('SOURCE_PAGE_CHANGED');
+        }
+        if (png == null) throw const FormatException('RENDER_FAILED');
+        final bytes = png.buffer.asUint8List(
+          png.offsetInBytes, png.lengthInBytes,
+        );
+        // Read the actual raster dimensions from the PNG header.
+        final header = ByteData.sublistView(bytes);
+        final width = header.getUint32(16);
+        final height = header.getUint32(20);
+        return {
+          'pngBase64': base64Encode(bytes),
+          'page': state.pageName,
+          'revision': revision,
+          'inkRevision': _revision(state),
+          'strokeIds': all
+              .where((renderer) => renderer.element is PenElement)
+              .map((renderer) => renderer.element.id).toList(),
+          'bounds': {
+            'x': bounds.left, 'y': bounds.top,
+            'width': bounds.width, 'height': bounds.height,
+          },
+          'transform': {
+            'offsetX': bounds.left, 'offsetY': bounds.top,
+            'scaleX': width / bounds.width,
+            'scaleY': height / bounds.height,
+          },
+        };
       case 'getSelectedInk':
         final selected = _selection(state, payload);
         return _source(state, selected, _bounds(selected));
@@ -199,6 +273,7 @@ class MathInkEmbedBridge {
         return {
           'data': (await state.saveData()).exportAsBytes().toList(),
           'revision': _revision(state),
+          'pageRevision': mathInkPageRevision(state.page),
           'page': state.pageName,
         };
       case 'locateInk':

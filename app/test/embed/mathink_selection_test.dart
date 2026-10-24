@@ -75,5 +75,28 @@ void main() {
       ],
     );
     expect(mathInkRevision(edited), isNot(mathInkRevision(before)));
+    expect(mathInkPageRevision(after), isNot(mathInkPageRevision(before)));
+  });
+
+  test('whole page export includes source text and ink independent of selection', () {
+    final ink = Renderer<PadElement>.fromInstance(
+      PadElement.pen(id: 'offscreen-ink'),
+    );
+    final text = Renderer<PadElement>.fromInstance(
+      PadElement.markdown(id: 'paragraph', text: '中文 English'),
+    );
+    final all = mathInkPageRenderers([ink, text]);
+    expect(all, [ink, text]);
+    final layer = DocumentLayer(id: 'layer', content: [
+      PadElement.markdown(id: 'text', text: 'before'),
+    ]);
+    final before = DocumentPage(layers: [layer]);
+    final after = before.copyWith(layers: [
+      layer.copyWith(content: [
+        PadElement.markdown(id: 'text', text: 'after'),
+      ]),
+    ]);
+    expect(mathInkRevision(before), mathInkRevision(after));
+    expect(mathInkPageRevision(before), isNot(mathInkPageRevision(after)));
   });
 }

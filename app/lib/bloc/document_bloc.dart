@@ -142,6 +142,29 @@ Area _createDuplicatedArea(Area area, List<Area> existingAreas) {
 }
 
 class DocumentBloc extends ReplayBloc<DocumentEvent, DocumentState> {
+  final Set<Future<void>> _pendingStateEffects = {};
+
+  /// A state is emitted before its renderers finish reloading. Host commands
+  /// must not start a new mutation while an older reload can overwrite them.
+  Future<void> waitForStateEffects() async {
+    while (_pendingStateEffects.isNotEmpty) {
+      await Future.wait(_pendingStateEffects.toList());
+    }
+  }
+
+  Future<void> _trackStateEffect(Future<void> effects) {
+    _pendingStateEffects.add(effects);
+    unawaited(
+      effects.then<void>(
+        (_) => _pendingStateEffects.remove(effects),
+        onError: (Object _, StackTrace _) {
+          _pendingStateEffects.remove(effects);
+        },
+      ),
+    );
+    return effects;
+  }
+
   final _historyReloadRunner = CoalescedAsyncRunner(
     delay: const Duration(milliseconds: 50),
   );
@@ -1778,7 +1801,7 @@ class DocumentBloc extends ReplayBloc<DocumentEvent, DocumentState> {
       }
     }
     emit(state);
-    return editorController.stateChanged(
+    final effects = editorController.stateChanged(
       state,
       this,
       oldState: oldState,
@@ -1791,6 +1814,7 @@ class DocumentBloc extends ReplayBloc<DocumentEvent, DocumentState> {
       shouldRefresh: shouldRefresh,
       updateIndex: updateIndex,
     );
+    return _trackStateEffect(effects);
   }
 
   @override
@@ -1896,7 +1920,7 @@ class DocumentBloc extends ReplayBloc<DocumentEvent, DocumentState> {
   }
 
   void _scheduleHistoryReload() =>
-      unawaited(_historyReloadRunner.schedule(reload));
+      unawaited(_trackStateEffect(_historyReloadRunner.schedule(reload)));
 
   Future<void> createTemplate(
     String? remote, {

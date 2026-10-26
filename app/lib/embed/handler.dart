@@ -120,8 +120,10 @@ class EmbedHandler {
   void register(BuildContext context, DocumentBloc bloc) {
     _mathInkBridge ??= MathInkEmbedBridge(context, bloc)..register();
     _blocSubscription ??= bloc.stream.listen((state) {
-      if (state is DocumentLoadSuccess &&
-          bloc.editorController.saveCubit.state.saved == .unsaved) {
+      if (state is DocumentLoadSuccess) {
+        // DocumentBloc emits before asynchronous renderer work marks the native
+        // save cubit unsaved. The host must observe the document state itself.
+        sendEmbedMessage('mathinkDirty', null);
         _changeDebounceTimer?.cancel();
         _changeDebounceTimer = Timer(
           const Duration(milliseconds: 500),

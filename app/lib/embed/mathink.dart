@@ -783,6 +783,16 @@ class MathInkEmbedBridge {
             bloc,
             handler: Handler.fromTool(tool),
           );
+          final controller = bloc.editorController;
+          final input = controller.inputCubit;
+          if (controller.saveCubit.state.embedding?.fullScreen.queryValue ==
+                  'forced' &&
+              input.state.hideUi != .keyboard) {
+            // A touch-hidden UI toggles back to visible first; normalize it so
+            // forced embeds keep the host's toolbar as the only tool surface.
+            if (input.state.hideUi == .touch) input.exitHideUI();
+            input.toggleKeyboardHideUI();
+          }
           return {'tool': name};
         }
       case 'setFingerWriting':

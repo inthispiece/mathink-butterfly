@@ -1224,7 +1224,9 @@ class RendererCubit(
             await e.setup(transformCubit, document, assetService, page),
       ),
     );
-    final backgrounds = page.backgrounds.map(Renderer.fromInstance).toList();
+    final backgrounds =
+        controller.mathInkBackgrounds?.call(page) ??
+        page.backgrounds.map(Renderer.fromInstance).toList();
     await Future.wait(
       backgrounds.map(
         (e) async =>

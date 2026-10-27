@@ -6,15 +6,103 @@ import 'dart:typed_data';
 
 import 'package:butterfly/bloc/document_bloc.dart';
 import 'package:butterfly/cubits/settings.dart';
+import 'package:butterfly/cubits/editor_controller.dart';
+import 'package:butterfly/cubits/transform.dart';
 import 'package:butterfly/handlers/handler.dart';
 import 'package:butterfly/models/viewport.dart';
 import 'package:butterfly/renderers/renderer.dart';
+import 'package:butterfly/services/asset.dart';
 import 'package:butterfly_api/butterfly_api.dart';
 import 'package:crypto/crypto.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter/gestures.dart';
 import 'package:go_router/go_router.dart';
 
 import 'action.dart';
+import 'mathink_navigation.dart';
+
+final _mathInkBridges = Expando<MathInkEmbedBridge>();
+MathInkEmbedBridge? mathInkHostBridge(DocumentBloc bloc) =>
+    _mathInkBridges[bloc];
+
+Rect mathInkPageGeometry(DocumentPage page) =>
+    mathInkPaperRect(mathInkPageMetadata(page)['geometry']);
+
+/// Build a new archive transaction without touching the live editor or history.
+NoteData mathInkPreparePdfPages(
+  NoteData original,
+  List<Map<String, dynamic>> pages, {
+  int? index,
+  String? afterPage,
+  bool replaceEmptyFirst = false,
+}) {
+  if (pages.isEmpty || pages.length > 300) {
+    throw const FormatException('INVALID_PDF_PAGE_COUNT');
+  }
+  var data = mathInkEnsurePageIds(original);
+  final existing = mathInkPageDirectory(data);
+  if (index != null && (index < 0 || index > existing.length)) {
+    throw const FormatException('INVALID_PAGE_INDEX');
+  }
+  final ids = existing.map((p) => p['id']).toSet();
+  for (final spec in pages) {
+    final id = spec['id'];
+    if (id is! String || id.isEmpty || id.length > 160 || !ids.add(id)) {
+      throw const FormatException('INVALID_PAGE_ID');
+    }
+    mathInkPaperRect(spec);
+  }
+  var rank =
+      index ??
+      (afterPage == null
+          ? existing.length
+          : existing.indexWhere((p) => p['id'] == afterPage) + 1);
+  if (index == null && afterPage != null && rank == 0) {
+    throw const FormatException('SOURCE_PAGE_MISSING');
+  }
+  String? remove;
+  if (replaceEmptyFirst) {
+    if (existing.length != 1) throw const FormatException('NOT_EMPTY_NOTEBOOK');
+    final page = data.getPage(existing.first['name'] as String)!;
+    if (page.content.isNotEmpty || page.extra['mathinkPdf'] != null) {
+      throw const FormatException('NOT_EMPTY_NOTEBOOK');
+    }
+    remove = existing.first['id'] as String;
+    rank = 0;
+  }
+  for (final spec in pages) {
+    final geometry = mathInkPaperRect(spec);
+    final page = DocumentPage(
+      backgrounds: mathInkPaperBackgrounds('blank'),
+      layers: [DocumentLayer(id: createUniqueId())],
+      extra: {
+        'mathinkPage': {
+          'id': spec['id'],
+          'paper': 'blank',
+          'aliases': <String>[],
+          'geometry': {'width': geometry.width, 'height': geometry.height},
+        },
+        'mathinkPdf': {
+          'resourceId': spec['resourceId'],
+          'pageIndex': spec['pageIndex'],
+          'rotation': spec['rotation'] ?? 0,
+        },
+      },
+    );
+    data = data
+        .setPage(
+          page,
+          spec['id'] as String,
+          mathInkInsertionIndex(data, rank++),
+        )
+        .$1;
+  }
+  if (remove != null) {
+    final raw = mathInkResolvePage(data, remove, includeDeleted: true)!;
+    data = data.removePage(raw);
+  }
+  return data;
+}
 
 /// Resolve exactly the requested pen IDs. Reject missing IDs and non-ink IDs
 /// rather than widening the export to whatever happens to occupy the bounds.
@@ -135,6 +223,11 @@ List<Map<String, dynamic>> mathInkPageDirectory(NoteData data) {
       'deleted': mathInkPageDeleted(page),
       'revision': mathInkRevision(page),
       'pageRevision': mathInkPageRevision(page),
+      'geometry': {
+        'width': mathInkPageGeometry(page).width,
+        'height': mathInkPageGeometry(page).height,
+      },
+      if (page.extra['mathinkPdf'] is Map) 'pdf': page.extra['mathinkPdf'],
     };
   }).toList();
 }
@@ -207,6 +300,8 @@ DocumentPage mathInkClonePage(DocumentPage original, String id) =>
           'id': id,
           'aliases': <String>[],
           'paper': mathInkPaper(original),
+          if (mathInkPageMetadata(original)['geometry'] != null)
+            'geometry': mathInkPageMetadata(original)['geometry'],
         },
         'mathinkOperations': <String, dynamic>{},
       },
@@ -263,8 +358,304 @@ class MathInkEmbedBridge {
   int _selectionGeneration = 0;
   SelectHandler? _observedSelection;
   StreamSubscription? _toolSubscription;
+  StreamSubscription? _viewSubscription, _viewportSubscription;
+  String? _hostSession, _hostPage;
+  Rect _geometry = const Rect.fromLTWH(0, 0, 1000, 1414);
+  bool _navigationLocked = true, _allowSwipe = false, _fingerWriting = false;
+  String _hostTool = 'pen';
+  Tool? _hostSelectedTool;
+  int _hostGeneration = 0;
+  final Set<int> _hostPointers = {};
+  final MathInkPageGesture _pageGesture = MathInkPageGesture();
+  Map<String, dynamic>? _viewAtDown;
+  Size? _lastViewport;
+  bool _settingHostView = false, _autoFitWidth = false;
+  String? _fitSignature;
+  int? _tapPointer;
+  Offset? _tapStart, _lastTap;
+  Duration? _tapBegan, _lastTapTime;
+  bool _tapBlocked = true;
+  String? _pdfPage;
+  ImageBackgroundRenderer? _pdfBackground;
+  PenElement? _pendingMouseDot;
+  String? _pendingDotPage;
+  Offset? _pendingDotPosition;
+  Duration? _pendingDotTime;
+  int? _doubleClickPointer;
+  Timer? _mouseDotTimer;
 
   MathInkEmbedBridge(this.context, this.bloc);
+
+  bool get hostInteractionReady {
+    final state = bloc.state;
+    return state is DocumentLoadSuccess &&
+        _hostSession != null &&
+        _hostPage == _pageId(state);
+  }
+
+  Size get _viewportSize {
+    final measured =
+        _lastViewport ??
+        bloc.editorController.rendererCubit.state.cameraViewport.viewportSize;
+    if (measured != null && measured.width > 0 && measured.height > 0) {
+      return measured;
+    }
+    return MediaQuery.sizeOf(context);
+  }
+
+  Map<String, dynamic> _hostEvent([Map<String, dynamic> extra = const {}]) => {
+    'noteId': _noteId,
+    'pageId': _hostPage,
+    'sessionId': _hostSession,
+    'generation': _hostGeneration,
+    'view': _view(),
+    'geometry': {'width': _geometry.width, 'height': _geometry.height},
+    'viewport': {'width': _viewportSize.width, 'height': _viewportSize.height},
+    'busy': _hostPointers.isNotEmpty,
+    'tool': switch (bloc.editorController.toolCubit.getHandler().data) {
+      PenTool() => 'pen',
+      EraserTool() => 'eraser',
+      SelectTool() => 'lasso',
+      HandTool() => 'pan',
+      _ => 'other',
+    },
+    ...extra,
+  };
+
+  void _emitHost(String name, [Map<String, dynamic> extra = const {}]) {
+    if (!hostInteractionReady) return;
+    _hostGeneration++;
+    sendEmbedMessage(name, _hostEvent(extra));
+  }
+
+  void _clampView() {
+    if (!hostInteractionReady || _settingHostView) return;
+    final cubit = bloc.editorController.transformCubit, view = cubit.state;
+    final size = _viewportSize,
+        width = size.width / view.size,
+        height = size.height / view.size;
+    final x = _geometry.width <= width
+        ? (_geometry.width - width) / 2
+        : view.position.dx.clamp(0.0, _geometry.width - width);
+    final y = _geometry.height <= height
+        ? (_geometry.height - height) / 2
+        : view.position.dy.clamp(
+            -24 / view.size,
+            _geometry.height - height + 24 / view.size,
+          );
+    if ((x - view.position.dx).abs() > .01 ||
+        (y - view.position.dy).abs() > .01 ||
+        view.rotation != 0) {
+      _settingHostView = true;
+      cubit.teleport(Offset(x.toDouble(), y.toDouble()), view.size, 0);
+      _settingHostView = false;
+    }
+  }
+
+  Map<String, dynamic> _fitHostPage(String mode) {
+    if (!['width', '100'].contains(mode)) {
+      throw const FormatException('INVALID_FIT_MODE');
+    }
+    final state = _state;
+    final paper = hostInteractionReady
+        ? _geometry
+        : mathInkPageGeometry(state.page);
+    final fitted = mathInkFitView(
+      paper,
+      _viewportSize,
+      widthOnly: mode == 'width',
+    );
+    _autoFitWidth = mode == 'width';
+    _settingHostView = true;
+    bloc.editorController.transformCubit.teleport(
+      fitted.position,
+      fitted.zoom,
+      0,
+    );
+    _fitSignature = jsonEncode(_view());
+    _settingHostView = false;
+    _emitHost('mathinkViewChanged');
+    return _view();
+  }
+
+  void hostPointerDown(PointerDownEvent event, Size viewport) {
+    if (!hostInteractionReady) return;
+    _lastViewport = viewport;
+    if (_pendingMouseDot != null) {
+      if (event.kind == PointerDeviceKind.mouse &&
+          _pendingDotPage == _pageId(_state) &&
+          _pendingDotPosition != null &&
+          _pendingDotTime != null &&
+          (event.localPosition - _pendingDotPosition!).distance < 24 &&
+          (event.timeStamp - _pendingDotTime!).inMilliseconds < 350) {
+        _mouseDotTimer?.cancel();
+        _mouseDotTimer = null;
+        _pendingMouseDot = null;
+        _doubleClickPointer = event.pointer;
+      } else {
+        unawaited(_flushMouseDot());
+      }
+    }
+    _hostPointers.add(event.pointer);
+    if (_hostPointers.length == 1) _viewAtDown = _view();
+    final camera = bloc.editorController.transformCubit.state;
+    _pageGesture.down(
+      event,
+      paper: _geometry,
+      viewport: viewport,
+      camera: camera.position,
+      zoom: camera.size,
+      allowed:
+          _allowSwipe &&
+          !_navigationLocked &&
+          !_fingerWriting &&
+          _hostTool == 'pan',
+      pointerCount: _hostPointers.length,
+    );
+    if (_hostPointers.length == 1 &&
+        !_navigationLocked &&
+        !_fingerWriting &&
+        (event.kind == PointerDeviceKind.touch ||
+            event.kind == PointerDeviceKind.mouse &&
+                ['pan', 'pen'].contains(_hostTool)) &&
+        _hostTool != 'lasso') {
+      _tapPointer = event.pointer;
+      _tapStart = event.localPosition;
+      _tapBegan = event.timeStamp;
+      _tapBlocked = false;
+    } else {
+      _tapBlocked = true;
+      _lastTap = null;
+      _lastTapTime = null;
+    }
+    _emitHost('mathinkInputState');
+  }
+
+  void hostPointerMove(PointerMoveEvent event) {
+    if (_tapPointer == event.pointer &&
+        _tapStart != null &&
+        (event.localPosition - _tapStart!).distance > 12) {
+      _tapBlocked = true;
+    }
+  }
+
+  void hostPointerUp(PointerUpEvent event) {
+    if (!hostInteractionReady) return;
+    final direction = _navigationLocked ? null : _pageGesture.up(event);
+    _hostPointers.remove(event.pointer);
+    if (direction != null && _viewAtDown != null) {
+      _settingHostView = true;
+      _setView(_viewAtDown!);
+      _settingHostView = false;
+    }
+    if (!_tapBlocked &&
+        _hostPointers.isEmpty &&
+        _tapPointer == event.pointer &&
+        _tapBegan != null &&
+        (event.timeStamp - _tapBegan!).inMilliseconds < 400) {
+      final world = bloc.editorController.transformCubit.state.localToGlobal(
+        event.localPosition,
+      );
+      final empty = !bloc.editorController.rendererCubit.renderers.any(
+        (r) => r.expandedRect?.contains(world) ?? true,
+      );
+      if (empty &&
+          _lastTap != null &&
+          _lastTapTime != null &&
+          (event.timeStamp - _lastTapTime!).inMilliseconds < 350 &&
+          (event.localPosition - _lastTap!).distance < 24) {
+        _fitHostPage('100');
+        _lastTap = null;
+        _lastTapTime = null;
+      } else if (empty) {
+        _lastTap = event.localPosition;
+        _lastTapTime = event.timeStamp;
+      }
+    }
+    _emitHost('mathinkInputState');
+    if (direction != null) {
+      _emitHost('mathinkPageIntent', {
+        'direction': direction,
+        'gestureGeneration': _pageGesture.generation,
+      });
+    }
+    if (_hostPointers.isEmpty) {
+      _pageGesture.reset();
+      _viewAtDown = null;
+    }
+  }
+
+  void hostPointerCancel(PointerEvent event) {
+    _hostPointers.remove(event.pointer);
+    _pageGesture.cancel();
+    _tapBlocked = true;
+    _lastTap = null;
+    _lastTapTime = null;
+    _emitHost('mathinkInputState');
+  }
+
+  /// Only mouse dots on non-interactive blank paper wait for a possible
+  /// double click. Real pens and actual mouse strokes keep their usual timing.
+  bool deferMouseDot(PointerUpEvent event, Handler handler) {
+    if (!hostInteractionReady ||
+        event.kind != PointerDeviceKind.mouse ||
+        handler is! PenHandler ||
+        _hostTool != 'pen') {
+      return false;
+    }
+    if (_doubleClickPointer == event.pointer) {
+      handler.detachUnsubmittedPointer(event.pointer);
+      _doubleClickPointer = null;
+      _lastTap = null;
+      _lastTapTime = null;
+      _fitHostPage('100');
+      unawaited(bloc.refresh(allowBake: false));
+      return true;
+    }
+    final candidate = handler.elements[event.pointer];
+    final position = bloc.editorController.transformCubit.state.localToGlobal(
+      event.localPosition,
+    );
+    final blank = !bloc.editorController.rendererCubit.renderers.any(
+      (r) => r.expandedRect?.contains(position) ?? true,
+    );
+    if (_navigationLocked ||
+        _fingerWriting ||
+        _tapBlocked ||
+        candidate == null ||
+        candidate.points.length != 1 ||
+        !blank) {
+      return false;
+    }
+    final dot = handler.detachUnsubmittedPointer(event.pointer);
+    if (dot == null) return false;
+    _pendingMouseDot = dot;
+    _pendingDotPage = _pageId(_state);
+    _pendingDotPosition = event.localPosition;
+    _pendingDotTime = event.timeStamp;
+    _mouseDotTimer?.cancel();
+    _mouseDotTimer = Timer(
+      const Duration(milliseconds: 250),
+      () => unawaited(_flushMouseDot()),
+    );
+    return true;
+  }
+
+  Future<void> _flushMouseDot() async {
+    final dot = _pendingMouseDot, page = _pendingDotPage;
+    _mouseDotTimer?.cancel();
+    _mouseDotTimer = null;
+    _pendingMouseDot = null;
+    if (dot == null) return;
+    final state = bloc.state;
+    if (state is! DocumentLoadSuccess || _pageId(state) != page) return;
+    final completed = bloc.stream.firstWhere(
+      (s) =>
+          s is DocumentLoadSuccess && s.page.content.any((e) => e.id == dot.id),
+    );
+    bloc.add(ElementsCreated([dot]));
+    await completed.timeout(const Duration(seconds: 10));
+  }
 
   String _revision(DocumentLoadSuccess state) => mathInkRevision(state.page);
 
@@ -495,6 +886,35 @@ class MathInkEmbedBridge {
     return {'x': view.position.dx, 'y': view.position.dy, 'zoom': view.size};
   }
 
+  Future<void> _activateHostTool(Tool tool, String name) async {
+    final controller = bloc.editorController;
+    final previous = controller.toolCubit.getHandler();
+    if (name == 'lasso' &&
+        previous is SelectHandler &&
+        previous.hostManaged &&
+        previous.data.mode == .lasso) {
+      _observeSelection(previous);
+    } else {
+      if (previous is SelectHandler) previous.clearSelection(bloc);
+      final next = name == 'lasso'
+          ? SelectHandler(tool as SelectTool, hostManaged: true)
+          : Handler.fromTool(tool);
+      if (next is SelectHandler) _observeSelection(next);
+      await controller.toolCubit.changeTool(controller, bloc, handler: next);
+    }
+    _hostTool = name;
+    _hostSelectedTool = tool;
+    if (name != 'pan') _pageGesture.cancel();
+    final input = controller.inputCubit;
+    if (controller.saveCubit.state.embedding?.fullScreen.queryValue ==
+            'forced' &&
+        input.state.hideUi != .keyboard) {
+      if (input.state.hideUi == .touch) input.exitHideUI();
+      input.toggleKeyboardHideUI();
+    }
+    _emitSelection();
+  }
+
   void _setView(Map<String, dynamic> payload) {
     final x = payload['x'], y = payload['y'], zoom = payload['zoom'];
     if (x is! num ||
@@ -603,6 +1023,233 @@ class MathInkEmbedBridge {
     },
   };
 
+  Future<Map<String, dynamic>> _renderFrozen(
+    NoteData data,
+    String id,
+    Map<String, dynamic> payload, {
+    Background? presentation,
+  }) async {
+    final name = mathInkResolvePage(data, id);
+    if (name == null) throw const FormatException('SOURCE_PAGE_MISSING');
+    var page = data.getPage(name)!;
+    final canonical = page, geometry = mathInkPageGeometry(page);
+    final annotationsOnly = payload['annotationsOnly'] == true;
+    if (annotationsOnly) {
+      page = page.copyWith(backgrounds: []);
+    } else if (presentation != null) {
+      page = page.copyWith(backgrounds: [presentation]);
+    }
+    final assets = AssetService(), transform = TransformCubit(1);
+    EditorController? controller;
+    List<Renderer<Background>> backgrounds = [];
+    try {
+      final viewport = await CameraViewport.build(
+        transform,
+        data,
+        assets,
+        page,
+      );
+      backgrounds = viewport.backgrounds;
+      controller = EditorController(
+        bloc.editorController.settingsCubit,
+        transform,
+        viewport,
+      );
+      final loaded = DocumentLoadSuccess(
+        data,
+        page: page,
+        pageName: name,
+        fileSystem: _state.fileSystem,
+        windowCubit: _state.windowCubit,
+        assetService: assets,
+        info: data.getInfo() ?? _state.info,
+      );
+      final all = mathInkPageRenderers(viewport.unbakedElements);
+      Rect bounds = geometry;
+      if (payload['bounds'] is Map) {
+        final value = _map(payload['bounds']);
+        final x = value['x'],
+            y = value['y'],
+            width = value['width'],
+            height = value['height'];
+        if ([x, y, width, height].any((n) => n is! num || !n.isFinite) ||
+            (width as num) <= 0 ||
+            (height as num) <= 0) {
+          throw const FormatException('INVALID_RENDER_BOUNDS');
+        }
+        bounds = Rect.fromLTWH(
+          (x as num).toDouble(),
+          (y as num).toDouble(),
+          width.toDouble(),
+          height.toDouble(),
+        );
+      } else {
+        for (final r in all) {
+          final rect = r.expandedRect!;
+          bounds = bounds.expandToInclude(rect.inflate(12));
+        }
+      }
+      final quality = payload['quality'] ?? 2.0,
+          maxDimension =
+              payload['maxDimension'] ??
+              (payload['quality'] == null ? 2048 : 8192);
+      if (quality is! num ||
+          !quality.isFinite ||
+          quality <= 0 ||
+          quality > 4 ||
+          maxDimension is! num ||
+          !maxDimension.isFinite ||
+          maxDimension < 32 ||
+          maxDimension > 8192 ||
+          bounds.width > 100000 ||
+          bounds.height > 100000) {
+        throw const FormatException('INVALID_RENDER_QUALITY');
+      }
+      final scale = min(
+        quality.toDouble(),
+        min(
+          maxDimension / max(bounds.width, bounds.height),
+          sqrt(32000000 / (bounds.width * bounds.height)),
+        ),
+      );
+      final png = await controller.rendererCubit.render(
+        controller,
+        data,
+        page,
+        loaded.info,
+        ImageExportOptions(
+          width: bounds.width,
+          height: bounds.height,
+          x: bounds.left,
+          y: bounds.top,
+          scale: 1,
+          quality: scale,
+          renderBackground: !annotationsOnly,
+        ),
+        cameraViewport: viewport,
+        docState: loaded,
+      );
+      if (png == null) throw const FormatException('RENDER_FAILED');
+      final bytes = png.buffer.asUint8List(
+            png.offsetInBytes,
+            png.lengthInBytes,
+          ),
+          header = ByteData.sublistView(bytes),
+          encoded = base64Encode(bytes);
+      final revision = mathInkPageRevision(canonical);
+      return {
+        'page': id,
+        'revision': revision,
+        'fullRevision': revision,
+        'inkRevision': mathInkRevision(canonical),
+        'strokeIds': all
+            .where((r) => r.element is PenElement)
+            .map((r) => r.element.id)
+            .toList(),
+        'bounds': {
+          'x': bounds.left,
+          'y': bounds.top,
+          'width': bounds.width,
+          'height': bounds.height,
+        },
+        'transform': {
+          'offsetX': bounds.left,
+          'offsetY': bounds.top,
+          'scaleX': header.getUint32(16) / bounds.width,
+          'scaleY': header.getUint32(20) / bounds.height,
+        },
+        'geometry': {'width': geometry.width, 'height': geometry.height},
+        'contentEmpty':
+            all.isEmpty &&
+            (annotationsOnly ||
+                canonical.extra['mathinkPdf'] == null && presentation == null),
+        'pngBase64': encoded,
+        'imageBase64': encoded,
+        'imageUrl': 'data:image/png;base64,$encoded',
+      };
+    } finally {
+      await controller?.close();
+      for (final renderer in backgrounds) {
+        renderer.dispose();
+      }
+      await assets.dispose();
+      await transform.close();
+    }
+  }
+
+  Future<void> _setPdfPresentation(Map<String, dynamic> payload) async {
+    _bindSelectionNote(payload);
+    final state = _state, id = payload['page'];
+    if (id != _pageId(state)) {
+      throw const FormatException('SOURCE_PAGE_CHANGED');
+    }
+    final geometry = mathInkPaperRect(payload), encoded = payload['pngBase64'];
+    if (encoded is! String || encoded.length > 48000000) {
+      throw const FormatException('INVALID_PDF_IMAGE');
+    }
+    final bytes = base64Decode(encoded);
+    if (bytes.length < 24 || bytes.length > 32000000) {
+      throw const FormatException('INVALID_PDF_IMAGE');
+    }
+    final header = ByteData.sublistView(bytes),
+        width = header.getUint32(16),
+        height = header.getUint32(20);
+    if (header.getUint32(0) != 0x89504e47 ||
+        header.getUint32(12) != 0x49484452 ||
+        width < 1 ||
+        height < 1 ||
+        width > 8192 ||
+        height > 8192 ||
+        width * height > 32000000) {
+      throw const FormatException('INVALID_PDF_IMAGE');
+    }
+    final expected = mathInkPageMetadata(state.page)['geometry'];
+    if (expected != null && mathInkPaperRect(expected) != geometry) {
+      throw const FormatException('PDF_GEOMETRY_MISMATCH');
+    }
+    final original = state.page.extra['mathinkPdf'];
+    if (original is Map &&
+        original['resourceId'] != null &&
+        original['resourceId'] != payload['resourceId']) {
+      throw const FormatException('PDF_RESOURCE_MISMATCH');
+    }
+    final background = ImageBackgroundRenderer(
+      Background.image(
+        source: 'data:image/png;base64,$encoded',
+        width: width.toDouble(),
+        height: height.toDouble(),
+        scaleX: geometry.width / width,
+        scaleY: geometry.height / height,
+        extra: {'mathinkPdf': true},
+      ) as ImageBackground,
+    );
+    await background.setup(
+      bloc.editorController.transformCubit,
+      state.data,
+      state.assetService,
+      state.page,
+    );
+    if (background.image == null) {
+      background.dispose();
+      throw const FormatException('PDF_IMAGE_LOAD_FAILED');
+    }
+    if (bloc.state != state) {
+      background.dispose();
+      throw const FormatException('SOURCE_PAGE_CHANGED');
+    }
+    final old = _pdfBackground;
+    _pdfPage = id as String;
+    _pdfBackground = background;
+    final renderers = bloc.editorController.rendererCubit;
+    renderers.setViewport(
+      renderers.state.cameraViewport.unbake(
+        backgrounds: [background],
+        unbakedElements: renderers.renderers,
+      ),
+    );
+    old?.dispose();
+  }
+
   Future<Map<String, dynamic>> _run(
     String method,
     Map<String, dynamic> payload,
@@ -641,7 +1288,136 @@ class MathInkEmbedBridge {
           'operationIdempotency': true,
           'selection': true,
           'selectionTransform': true,
+          'pdfBackground': true,
+          'frozenPageRender': true,
+          'liveView': true,
+          'pageGestures': true,
         };
+      case 'preparePdfPages':
+        {
+          final raw = payload['data'];
+          if (raw != null &&
+              (raw is! List ||
+                  raw.isEmpty ||
+                  !raw.every((n) => n is int && n >= 0 && n <= 255))) {
+            throw const FormatException('INVALID_DOCUMENT');
+          }
+          final original = raw == null
+              ? await _savedDocument()
+              : NoteData.fromData(
+                  Uint8List.fromList((raw as List).cast<int>()),
+                );
+          final pages = payload['pages'];
+          if (pages is! List) {
+            throw const FormatException('INVALID_PDF_PAGE_COUNT');
+          }
+          final index = payload['index'];
+          if (index != null && index is! int) {
+            throw const FormatException('INVALID_PAGE_INDEX');
+          }
+          final prepared = mathInkPreparePdfPages(
+            original,
+            pages.map(_map).toList(),
+            index: index as int?,
+            afterPage: payload['afterPage'] as String?,
+            replaceEmptyFirst: payload['replaceEmptyFirst'] == true,
+          );
+          final catalog = mathInkPageDirectory(prepared),
+              id =
+                  catalog.firstWhere((p) => p['deleted'] != true)['id']
+                      as String;
+          final selected = prepared.getPage(mathInkResolvePage(prepared, id)!)!;
+          return {
+            'data': prepared.exportAsBytes().toList(),
+            'pages': catalog,
+            'page': id,
+            'currentPage': id,
+            'revision': mathInkRevision(selected),
+            'pageRevision': mathInkPageRevision(selected),
+          };
+        }
+      case 'inspectFrozenDocument':
+        {
+          final raw = payload['data'];
+          if (raw is! List ||
+              raw.isEmpty ||
+              raw.length > 150000000 ||
+              !raw.every((n) => n is int && n >= 0 && n <= 255)) {
+            throw const FormatException('INVALID_DOCUMENT');
+          }
+          final frozen = NoteData.fromData(Uint8List.fromList(raw.cast<int>()));
+          final catalog = mathInkPageDirectory(frozen);
+          return {
+            'pages': catalog.map((p) {
+              final page = frozen.getPage(p['name'] as String)!;
+              return {
+                ...p,
+                'contentEmpty':
+                    page.content.isEmpty && page.extra['mathinkPdf'] == null,
+              };
+            }).toList(),
+            'currentPage': catalog.firstWhere(
+              (p) => p['deleted'] != true,
+            )['id'],
+          };
+        }
+      case 'renderFrozenPage':
+        {
+          final raw = payload['data'], id = payload['page'];
+          if (raw is! List ||
+              raw.isEmpty ||
+              raw.length > 150000000 ||
+              !raw.every((n) => n is int && n >= 0 && n <= 255) ||
+              id is! String) {
+            throw const FormatException('INVALID_DOCUMENT');
+          }
+          return _renderFrozen(
+            NoteData.fromData(Uint8List.fromList(raw.cast<int>())),
+            id,
+            payload,
+          );
+        }
+      case 'setPdfBackground':
+        await _setPdfPresentation(payload);
+        return {'ready': true, 'page': _pageId(_state), 'persisted': false};
+      case 'configureHostInteraction':
+        {
+          _bindSelectionNote(payload);
+          final session = payload['sessionId'], page = payload['pageId'];
+          if (session is! String ||
+              session.isEmpty ||
+              session.length > 160 ||
+              page != _pageId(_state) ||
+              payload['navigationLocked'] is! bool) {
+            throw const FormatException('INVALID_HOST_INTERACTION');
+          }
+          final changed = _hostSession != session || _hostPage != page;
+          if (changed) {
+            _hostPointers.clear();
+            _pageGesture.reset();
+            _lastTap = null;
+            _lastTapTime = null;
+          }
+          _hostSession = session;
+          _hostPage = page as String;
+          _geometry = mathInkPaperRect(payload['geometry']);
+          _navigationLocked = payload['navigationLocked'] as bool;
+          _allowSwipe = payload['allowSwipe'] == true;
+          _fingerWriting = payload['fingerWriting'] == true;
+          if (_navigationLocked) _pageGesture.cancel();
+          if (_pdfPage != _hostPage) {
+            _pdfBackground?.dispose();
+            _pdfBackground = null;
+            _pdfPage = null;
+          }
+          _emitHost('mathinkViewChanged');
+          _emitHost('mathinkInputState');
+          return _hostEvent();
+        }
+      case 'getViewport':
+        return _hostEvent();
+      case 'fitPage':
+        return _fitHostPage(payload['mode'] as String? ?? 'width');
       case 'getSelection':
         _bindSelectionNote(payload);
         await _waitRenderers();
@@ -923,6 +1699,7 @@ class MathInkEmbedBridge {
         return _view();
       case 'finishInput':
         {
+          await _flushMouseDot();
           final controller = bloc.editorController;
           final handler = controller.toolCubit.getHandler();
           final pendingIds = handler is PenHandler
@@ -945,10 +1722,12 @@ class MathInkEmbedBridge {
           return _pageState();
         }
       case 'setView':
+        _autoFitWidth = false;
         _setView(payload);
         return _view();
       case 'setTool':
         {
+          await _flushMouseDot();
           _bindSelectionNote(payload);
           final name = payload['tool'];
           final width = payload['width'] as num? ?? 3;
@@ -976,34 +1755,7 @@ class MathInkEmbedBridge {
             'pan' => HandTool(),
             _ => throw const FormatException('UNSUPPORTED_TOOL'),
           };
-          final controller = bloc.editorController;
-          final previous = controller.toolCubit.getHandler();
-          if (name == 'lasso' &&
-              previous is SelectHandler &&
-              previous.data.mode == .lasso) {
-            _observeSelection(previous);
-          } else {
-            if (previous is SelectHandler) previous.clearSelection(bloc);
-            final next = name == 'lasso'
-                ? SelectHandler(tool as SelectTool, hostManaged: true)
-                : Handler.fromTool(tool);
-            if (next is SelectHandler) _observeSelection(next);
-            await controller.toolCubit.changeTool(
-              controller,
-              bloc,
-              handler: next,
-            );
-          }
-          final input = controller.inputCubit;
-          if (controller.saveCubit.state.embedding?.fullScreen.queryValue ==
-                  'forced' &&
-              input.state.hideUi != .keyboard) {
-            // A touch-hidden UI toggles back to visible first; normalize it so
-            // forced embeds keep the host's toolbar as the only tool surface.
-            if (input.state.hideUi == .touch) input.exitHideUI();
-            input.toggleKeyboardHideUI();
-          }
-          _emitSelection();
+          await _activateHostTool(tool, name as String);
           return {'tool': name};
         }
       case 'setFingerWriting':
@@ -1013,6 +1765,8 @@ class MathInkEmbedBridge {
             throw const FormatException('INVALID_INPUT_MODE');
           }
           final settings = _state.settingsCubit;
+          _fingerWriting = enabled;
+          if (enabled) _pageGesture.cancel();
           await settings.changeInputConfiguration(
             settings.state.inputConfiguration.copyWith(
               touch: InputMapping(
@@ -1052,6 +1806,21 @@ class MathInkEmbedBridge {
           final expectedPage = payload['page'];
           if (expectedPage != null && expectedPage != _pageId(state)) {
             throw const FormatException('SOURCE_PAGE_CHANGED');
+          }
+          if (state.page.extra['mathinkPdf'] != null ||
+              payload['annotationsOnly'] == true) {
+            if (payload['annotationsOnly'] != true &&
+                (_pdfPage != _pageId(state) || _pdfBackground == null)) {
+              throw const FormatException('PDF_BACKGROUND_NOT_READY');
+            }
+            return _renderFrozen(
+              await _savedDocument(),
+              _pageId(state),
+              payload,
+              presentation: payload['annotationsOnly'] == true
+                  ? null
+                  : _pdfBackground?.element,
+            );
           }
           final revision = mathInkPageRevision(state.page);
           final all = mathInkPageRenderers(
@@ -1340,6 +2109,7 @@ class MathInkEmbedBridge {
         }
       case 'getDocument':
         {
+          await _flushMouseDot();
           await _ensureIds();
           final current = _state;
           final saved = await _savedDocument();
@@ -1473,7 +2243,32 @@ class MathInkEmbedBridge {
     String method,
     Map<String, dynamic> payload,
   ) {
-    final result = _requestQueue.then((_) => _run(method, payload));
+    final result = _requestQueue.then((_) async {
+      final value = await _run(method, payload);
+      // Reloads select document toolbar index zero. Host tools are independent
+      // of that toolbar, and must be restored before the frame becomes ready.
+      if (_hostSelectedTool != null &&
+          {
+            'switchPage',
+            'createPage',
+            'duplicatePage',
+            'deletePage',
+            'restorePage',
+            'reorderPages',
+            'setPaper',
+            'undo',
+            'redo',
+          }.contains(method)) {
+        await _waitRenderers();
+        final active = bloc.editorController.toolCubit.getHandler();
+        if (active.data != _hostSelectedTool ||
+            _hostTool == 'lasso' &&
+                (active is! SelectHandler || !active.hostManaged)) {
+          await _activateHostTool(_hostSelectedTool!, _hostTool);
+        }
+      }
+      return value;
+    });
     _requestQueue = result.then<void>(
       (_) {},
       onError: (Object _, StackTrace _) {},
@@ -1482,6 +2277,40 @@ class MathInkEmbedBridge {
   }
 
   void register() {
+    _mathInkBridges[bloc] = this;
+    bloc.editorController.mathInkBackgrounds = (page) =>
+        mathInkPageMetadata(page)['id'] == _pdfPage && _pdfBackground != null
+        ? [_pdfBackground!]
+        : null;
+    _viewSubscription ??= bloc.editorController.transformCubit.stream.listen((
+      _,
+    ) {
+      if (!hostInteractionReady) return;
+      if (!_settingHostView && jsonEncode(_view()) != _fitSignature) {
+        _autoFitWidth = false;
+      }
+      _clampView();
+      _emitHost('mathinkViewChanged');
+    });
+    _viewportSubscription ??= bloc.editorController.rendererCubit.stream.listen(
+      (state) {
+        final size = state.cameraViewport.viewportSize;
+        if (size == null ||
+            size.width <= 0 ||
+            size.height <= 0 ||
+            size == _lastViewport) {
+          return;
+        }
+        _lastViewport = size;
+        if (hostInteractionReady) {
+          if (_autoFitWidth) {
+            _fitHostPage('width');
+          } else {
+            _emitHost('mathinkViewChanged');
+          }
+        }
+      },
+    );
     _toolSubscription ??= bloc.editorController.toolCubit.stream.listen((_) {
       final handler = bloc.editorController.toolCubit.getHandler();
       if (handler is SelectHandler) {
@@ -1522,6 +2351,20 @@ class MathInkEmbedBridge {
   }
 
   void unregister() {
+    _mouseDotTimer?.cancel();
+    _mouseDotTimer = null;
+    _pendingMouseDot = null;
+    _mathInkBridges[bloc] = null;
+    _viewSubscription?.cancel();
+    _viewSubscription = null;
+    _viewportSubscription?.cancel();
+    _viewportSubscription = null;
+    bloc.editorController.mathInkBackgrounds = null;
+    _pdfBackground?.dispose();
+    _pdfBackground = null;
+    _pdfPage = null;
+    _hostPointers.clear();
+    _pageGesture.reset();
     _toolSubscription?.cancel();
     _toolSubscription = null;
     _observedSelection?.mathInkSelectionChanged = null;

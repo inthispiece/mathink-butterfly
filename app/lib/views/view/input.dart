@@ -52,6 +52,9 @@ class _ViewportInputCoordinator {
     final cubit = input.cubit;
     final getHandler = input.getHandler;
     final getEventContext = input.getEventContext;
+    if (!skipShortcuts)
+      mathInkHostBridge(input.bloc)
+          ?.hostPointerDown(event, getEventContext().viewportSize);
     if (!skipShortcuts && cubit.inputCubit.state.pointers.isEmpty) {
       _settleSlide(cubit.transformCubit);
       _handlerHandlesScaleGesture = event.kind == .trackpad ? false : null;
@@ -99,6 +102,7 @@ class _ViewportInputCoordinator {
     bool skipShortcuts = false,
   }) async {
     final cubit = input.cubit;
+    if (!skipShortcuts) mathInkHostBridge(input.bloc)?.hostPointerMove(event);
     if (!skipShortcuts) {
       final result = _shortcutManager.pointerMove(event);
       await _replayPointerEvents(result.releasedEvents, input);
@@ -151,7 +155,10 @@ class _ViewportInputCoordinator {
               unawaited(_replayPointerEvents(events, input)),
         );
         await _replayPointerEvents(result.releasedEvents, input);
-        if (result.consumed) return;
+        if (result.consumed) {
+          mathInkHostBridge(input.bloc)?.hostPointerCancel(event);
+          return;
+        }
       }
     }
 
@@ -159,12 +166,17 @@ class _ViewportInputCoordinator {
     final wasRulerInteraction = _ruler != null;
     _resetRulerInteraction();
     if (!wasRulerInteraction && _isHandlerGesture) {
-      await input.getHandler().onPointerUp(event, input.getEventContext());
+      final handler = input.getHandler();
+      if (mathInkHostBridge(input.bloc)?.deferMouseDot(event, handler) !=
+          true) {
+        await handler.onPointerUp(event, input.getEventContext());
+      }
     }
     cubit.inputCubit.removePointer(event.pointer);
     _pointerKinds.remove(event.pointer);
     if (wasRulerInteraction) cubit.inputCubit.removeButtons();
     cubit.toolCubit.resetReleaseHandler(input.bloc, cubit.rendererCubit);
+    if (!skipShortcuts) mathInkHostBridge(input.bloc)?.hostPointerUp(event);
   }
 
   Future<void> _replayPointerEvents(
@@ -190,6 +202,7 @@ class _ViewportInputCoordinator {
     _PointerInputContext input,
   ) {
     final cubit = input.cubit;
+    mathInkHostBridge(input.bloc)?.hostPointerCancel(event);
     if (_shortcutManager.pointerCancel(event)) return;
     final handler = input.getHandler();
     if (handler is SelectHandler && handler.hostManaged) {
@@ -344,6 +357,11 @@ class _ViewportInputCoordinator {
       handler.onScaleEnd(details, input.getEventContext());
     }
     if (isNavigation) {
+      if (mathInkHostBridge(input.bloc)?.hostInteractionReady == true) {
+        cubit.inputCubit.removeButtons();
+        _resetRulerInteraction();
+        return;
+      }
       final settings = input.context.read<SettingsCubit>().state;
       final sensitivity = settings.gestureSensitivity;
       cubit.rendererCubit.cancelDelayedBake();
@@ -366,13 +384,22 @@ class _ViewportInputCoordinator {
     PointerSignalEvent event,
     _PointerInputContext input,
   ) {
-    if (input.state is! DocumentLoadSuccess || event is! PointerScrollEvent) {
-      return;
-    }
-
+    if (input.state is! DocumentLoadSuccess) return;
     final settings = input.context.read<SettingsCubit>().state;
     final sensitivity = settings.scrollSensitivity;
     final cubit = input.cubit;
+    // Flutter Web converts Windows Ctrl+wheel into a scale signal.
+    if (event is PointerScaleEvent) {
+      if (!event.scale.isFinite || event.scale <= 0) return;
+      cubit.transformCubit.zoomConstrained(
+        event.scale,
+        cursor: event.localPosition,
+        runtime: cubit,
+      );
+      _delayBakeUnlessSmooth(settings, input.delayBake);
+      return;
+    }
+    if (event is! PointerScrollEvent) return;
     final scrollDelta = event.scrollDelta / sensitivity;
     final keyboard = HardwareKeyboard.instance;
 

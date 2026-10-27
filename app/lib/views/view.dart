@@ -5,6 +5,7 @@ import 'package:butterfly/cubits/editor_controller.dart';
 import 'package:butterfly/cubits/settings.dart';
 import 'package:butterfly/cubits/transform.dart';
 import 'package:butterfly/handlers/handler.dart';
+import 'package:butterfly/embed/mathink.dart';
 import 'package:butterfly/services/pointer_shortcuts.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/gestures.dart';

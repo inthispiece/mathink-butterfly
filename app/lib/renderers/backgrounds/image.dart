@@ -26,6 +26,17 @@ class ImageBackgroundRenderer extends Renderer<ImageBackground> {
 
     var paint = Paint();
 
+    if (element.extra['mathinkPdf'] == true) {
+      // A PDF is a fixed page, never Butterfly's normal repeating wallpaper.
+      canvas.drawImageRect(
+        image!,
+        Rect.fromLTWH(0, 0, element.width, element.height),
+        Rect.fromLTWH(0, 0, sizeX, sizeY),
+        paint,
+      );
+      return;
+    }
+
     for (var x = offsetX; x < viewport.right; x += sizeX) {
       for (var y = offsetY; y < viewport.bottom; y += sizeY) {
         canvas.drawImageRect(

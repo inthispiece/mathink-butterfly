@@ -21,6 +21,25 @@ class PenHandler extends Handler<PenTool> with ColoredHandler {
 
   PenHandler(super.data);
 
+  /// Detach a still-unsubmitted mouse dot for the host's double-click window.
+  /// It is never removed through undo, so cancelling a double click creates no
+  /// document history entries and cannot undo someone else's work.
+  PenElement? detachUnsubmittedPointer(int pointer) {
+    final element = elements.remove(pointer);
+    final samples = _elementPoints.remove(pointer);
+    lastPosition.remove(pointer);
+    _positionCheckTimer?.cancel();
+    _positionCheckTimer = null;
+    isDrawing = false;
+    points.clear();
+    lastPosit = null;
+    return element == null
+        ? null
+        : samples == null
+        ? element
+        : element.copyWith(points: List<PathPoint>.of(samples));
+  }
+
   // Create foregrounds for rendering the PenRendere
   @override
   List<Renderer> createForegrounds(

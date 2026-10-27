@@ -46,6 +46,9 @@ class EditorController(
   bool absolute = false,
 }) implements EditorRuntimeContext {
   final FocusNode focusNode = .new();
+  // Host PDF rasters are a presentation cache. The original binary and page
+  // mapping remain in MathInk storage and are never rewritten by a view load.
+  List<Renderer<Background>>? Function(DocumentPage page)? mathInkBackgrounds;
   NetworkingService get networkingService => _networkingService ??= .new();
   @override
   final RendererCubit rendererCubit = .new(

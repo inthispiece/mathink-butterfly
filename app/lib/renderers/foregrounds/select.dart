@@ -67,6 +67,8 @@ extension TransformResultGeometry on TransformResult {
 
 class RectSelectionForegroundManager {
   final bool enableRotation;
+  final bool forceProportional;
+  double minimumScale = .05, maximumScale = 20;
   Rect _selection = .zero;
   SelectionScaleMode _scaleMode = .scale;
   bool _proportionalModifier = false;
@@ -79,7 +81,10 @@ class RectSelectionForegroundManager {
   SelectionTransformCorner? _corner;
   Offset? _startPosition, _currentPosition;
 
-  RectSelectionForegroundManager({this.enableRotation = true});
+  RectSelectionForegroundManager({
+    this.enableRotation = true,
+    this.forceProportional = false,
+  });
 
   Rect get selection => _selection;
 
@@ -176,7 +181,7 @@ class RectSelectionForegroundManager {
   }
 
   SelectionScaleMode get _effectiveScaleMode =>
-      (_scaleMode == .scaleProp) != _proportionalModifier
+      forceProportional || (_scaleMode == .scaleProp) != _proportionalModifier
       ? SelectionScaleMode.scaleProp
       : SelectionScaleMode.scale;
 
@@ -284,8 +289,11 @@ class RectSelectionForegroundManager {
       default:
         moved = delta;
     }
-    if (_effectiveScaleMode == .scaleProp) {
-      final scale = (scaleX - 1).abs() > (scaleY - 1).abs() ? scaleX : scaleY;
+    if (_effectiveScaleMode == .scaleProp &&
+        _corner != null &&
+        _corner != .center) {
+      var scale = (scaleX - 1).abs() > (scaleY - 1).abs() ? scaleX : scaleY;
+      if (forceProportional) scale = scale.clamp(minimumScale, maximumScale);
       scaleX = scale;
       scaleY = scale;
       moved = switch (_corner) {

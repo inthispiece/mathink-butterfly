@@ -185,8 +185,16 @@ class _ViewportInputCoordinator {
     }
   }
 
-  void handlePointerCancel(PointerCancelEvent event, EditorController cubit) {
+  void handlePointerCancel(
+    PointerCancelEvent event,
+    _PointerInputContext input,
+  ) {
+    final cubit = input.cubit;
     if (_shortcutManager.pointerCancel(event)) return;
+    final handler = input.getHandler();
+    if (handler is SelectHandler && handler.hostManaged) {
+      handler.cancelTransform(input.bloc);
+    }
     _resetRulerInteraction();
     cubit.inputCubit.removePointer(event.pointer);
     _pointerKinds.remove(event.pointer);
@@ -218,6 +226,13 @@ class _ViewportInputCoordinator {
   void handleScaleStart(ScaleStartDetails details, _PointerInputContext input) {
     final cubit = input.cubit;
     final handler = input.getHandler();
+    if (details.pointerCount > 1 &&
+        handler is SelectHandler &&
+        handler.hostManaged) {
+      if (_handlerHandlesScaleGesture != false)
+        handler.cancelTransform(input.bloc);
+      _handlerHandlesScaleGesture = false;
+    }
     final eventContext = input.getEventContext();
     _handlerHandlesScaleGesture ??= !_isTouchMoveGesture(cubit);
 
@@ -249,6 +264,13 @@ class _ViewportInputCoordinator {
     _PointerInputContext input,
   ) {
     final handler = input.getHandler();
+    if (details.pointerCount > 1 &&
+        handler is SelectHandler &&
+        handler.hostManaged) {
+      if (_handlerHandlesScaleGesture != false)
+        handler.cancelTransform(input.bloc);
+      _handlerHandlesScaleGesture = false;
+    }
     final ruler = _ruler;
     if (ruler != null) {
       if (_rulerPointer == null) {
@@ -315,7 +337,12 @@ class _ViewportInputCoordinator {
     final isNavigation = !_isHandlerGesture;
     if (isNavigation && details.pointerCount > 0) return;
 
-    input.getHandler().onScaleEnd(details, input.getEventContext());
+    final handler = input.getHandler();
+    if (isNavigation && handler is SelectHandler && handler.hostManaged) {
+      handler.cancelTransform(input.bloc);
+    } else {
+      handler.onScaleEnd(details, input.getEventContext());
+    }
     if (isNavigation) {
       final settings = input.context.read<SettingsCubit>().state;
       final sensitivity = settings.gestureSensitivity;

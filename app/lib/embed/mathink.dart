@@ -35,6 +35,22 @@ List<Renderer<PadElement>> resolveMathInkPens(
   return selected;
 }
 
+/// Never silently turn a mixed visual selection into a smaller OCR request.
+List<Renderer<PadElement>> mathInkSelectedPens(
+  Iterable<Renderer<PadElement>> selection,
+) {
+  final selected = selection.toList();
+  if (selected.any((renderer) => renderer.element is! PenElement)) {
+    final onlyMath = selected.every(
+      (renderer) =>
+          renderer.element is MarkdownElement &&
+          renderer.element.extra['mathink'] is Map,
+    );
+    throw FormatException(onlyMath ? 'FORMULA_SELECTION' : 'MIXED_SELECTION');
+  }
+  return selected;
+}
+
 ImageExportOptions mathInkImageOptions(Rect bounds) => ImageExportOptions(
   width: bounds.width,
   height: bounds.height,
@@ -219,6 +235,22 @@ List<Renderer<PadElement>> mathInkPageRenderers(
   return all;
 }
 
+List<String> mathInkAffectedPages(NoteData before, NoteData after) {
+  Map<String, String> catalog(NoteData document) => {
+    for (final page in mathInkPageDirectory(document))
+      page['id'] as String: jsonEncode([
+        page['index'],
+        page['deleted'],
+        page['pageRevision'],
+      ]),
+  };
+  final previous = catalog(before), current = catalog(after);
+  return {
+    ...previous.keys,
+    ...current.keys,
+  }.where((id) => previous[id] != current[id]).toList();
+}
+
 /// Correlated host requests. A PNG is rendered from selected pen renderers,
 /// never by cropping a screenshot which could include unrelated handwriting.
 class MathInkEmbedBridge {
@@ -227,6 +259,10 @@ class MathInkEmbedBridge {
   EventListener? _listener;
   Future<void> _requestQueue = Future.value();
   final Map<String, Map<String, dynamic>> _operationReceipts = {};
+  String? _noteId, _selectionSignature;
+  int _selectionGeneration = 0;
+  SelectHandler? _observedSelection;
+  StreamSubscription? _toolSubscription;
 
   MathInkEmbedBridge(this.context, this.bloc);
 
@@ -242,6 +278,111 @@ class MathInkEmbedBridge {
 
   String _pageId(DocumentLoadSuccess state) =>
       mathInkStablePageId(state.page, state.pageName);
+
+  void _bindSelectionNote(Map<String, dynamic> payload) {
+    final note = payload['noteId'];
+    if (note == null) return;
+    if (note is! String || note.isEmpty || note.length > 160) {
+      throw const FormatException('INVALID_NOTE');
+    }
+    if (_noteId != null && note != _noteId) {
+      throw const FormatException('NOTE_MISMATCH');
+    }
+    _noteId = note;
+  }
+
+  Map<String, dynamic> _selectionState() {
+    final current = _state;
+    final handler = bloc.editorController.toolCubit.getHandler();
+    final selected = handler is SelectHandler
+        ? handler.selectedRenderers
+        : <Renderer<PadElement>>[];
+    final bounds = handler is SelectHandler ? handler.getSelectionRect() : null;
+    final signature = jsonEncode([
+      _noteId,
+      _pageId(current),
+      mathInkPageRevision(current.page),
+      handler is SelectHandler ? 'lasso' : 'other',
+      handler is SelectHandler ? handler.selectionEpoch : 0,
+      selected.map((renderer) => renderer.element.toJson()).toList(),
+    ]);
+    if (signature != _selectionSignature) {
+      _selectionSignature = signature;
+      _selectionGeneration++;
+    }
+    return {
+      'noteId': _noteId,
+      'pageId': _pageId(current),
+      'objectIds': selected.map((r) => r.element.id).nonNulls.toList(),
+      'inkIds': selected
+          .where((r) => r.element is PenElement)
+          .map((r) => r.element.id)
+          .nonNulls
+          .toList(),
+      'mathIds': selected
+          .where(
+            (r) =>
+                r.element is MarkdownElement &&
+                r.element.extra['mathink'] is Map,
+          )
+          .map((r) => r.element.id)
+          .nonNulls
+          .toList(),
+      'otherIds': selected
+          .where(
+            (r) =>
+                r.element is! PenElement &&
+                !(r.element is MarkdownElement &&
+                    r.element.extra['mathink'] is Map),
+          )
+          .map((r) => r.element.id)
+          .nonNulls
+          .toList(),
+      'bounds': bounds == null
+          ? null
+          : {
+              'x': bounds.left,
+              'y': bounds.top,
+              'width': bounds.width,
+              'height': bounds.height,
+            },
+      'revision': mathInkPageRevision(current.page),
+      'inkRevision': _revision(current),
+      'generation': _selectionGeneration,
+      'tool': handler is SelectHandler ? 'lasso' : 'other',
+    };
+  }
+
+  void _emitSelection() {
+    try {
+      final previous = _selectionGeneration;
+      final selection = _selectionState();
+      if (previous != _selectionGeneration) {
+        sendEmbedMessage('mathinkSelectionChanged', selection);
+      }
+    } on FormatException {
+      // A disposed/rebuilding document has no transferable selection.
+    }
+  }
+
+  void _observeSelection(SelectHandler handler) {
+    if (_observedSelection != handler) {
+      _observedSelection?.mathInkSelectionChanged = null;
+      _observedSelection = handler;
+      handler.mathInkSelectionChanged = _emitSelection;
+    }
+  }
+
+  void _validateSelectionToken(Map<String, dynamic> payload) {
+    _bindSelectionNote(payload);
+    final selection = _selectionState();
+    final page = payload['pageId'] ?? payload['page'];
+    if (page != null && page != selection['pageId'] ||
+        payload['generation'] != null &&
+            payload['generation'] != selection['generation']) {
+      throw const FormatException('STALE_SELECTION');
+    }
+  }
 
   Future<void> _waitRenderers() async {
     await bloc.waitForStateEffects();
@@ -285,8 +426,7 @@ class MathInkEmbedBridge {
   Future<void> _ensureIds() async {
     final state = _state;
     final data = await state.saveData();
-    var normalized = mathInkEnsurePageIds(data);
-    var changed = false;
+    final normalized = mathInkEnsurePageIds(data);
     for (final name in normalized.getPages(true)) {
       final page = normalized.getPage(name)!;
       final id = mathInkStablePageId(page, name);
@@ -295,31 +435,40 @@ class MathInkEmbedBridge {
           : <String, dynamic>{};
       final known = _operationReceipts.putIfAbsent(id, () => {});
       known.addAll(receipts);
-      if (known.isNotEmpty && jsonEncode(known) != jsonEncode(receipts)) {
-        normalized = normalized
-            .setPage(
-              page.copyWith(
-                extra: {
-                  ...page.extra,
-                  'mathinkOperations': Map<String, dynamic>.from(known),
-                },
-              ),
-              name,
-            )
-            .$1;
-        changed = true;
-      }
     }
-    if (!changed &&
-        data
-            .getPages(true)
-            .every(
-              (name) => mathInkPageMetadata(data.getPage(name)!)['id'] != null,
-            )) {
+    if (data
+        .getPages(true)
+        .every(
+          (name) => mathInkPageMetadata(data.getPage(name)!)['id'] != null,
+        )) {
       return;
     }
     if (bloc.state != state) throw const FormatException('SOURCE_PAGE_CHANGED');
     await _replaceData(normalized);
+  }
+
+  /// Bookkeeping is exported into an immutable archive copy. It must not add
+  /// DocumentRebuilt entries to the user's native undo/redo timeline.
+  Future<NoteData> _savedDocument() async {
+    var saved = await _state.saveData();
+    for (final name in saved.getPages(true)) {
+      final page = saved.getPage(name)!;
+      final known = _operationReceipts[mathInkStablePageId(page, name)];
+      if (known == null || known.isEmpty) continue;
+      final receipts = page.extra['mathinkOperations'] is Map
+          ? Map<String, dynamic>.from(page.extra['mathinkOperations'] as Map)
+          : <String, dynamic>{};
+      receipts.addAll(known);
+      saved = saved
+          .setPage(
+            page.copyWith(
+              extra: {...page.extra, 'mathinkOperations': receipts},
+            ),
+            name,
+          )
+          .$1;
+    }
+    return saved;
   }
 
   Future<void> _switch(String id) async {
@@ -407,10 +556,15 @@ class MathInkEmbedBridge {
     DocumentLoadSuccess state,
     Map<String, dynamic> payload,
   ) {
+    _validateSelectionToken(payload);
     final expected = payload['revision'];
     if (expected != null && expected != _revision(state)) {
       throw const FormatException('STALE_SELECTION');
     }
+    final handler = bloc.editorController.toolCubit.getHandler();
+    final actual = handler is SelectHandler
+        ? mathInkSelectedPens(handler.selectedRenderers)
+        : <Renderer<PadElement>>[];
     final requested = payload['strokeIds'];
     if (requested is List) {
       return resolveMathInkPens(
@@ -418,11 +572,7 @@ class MathInkEmbedBridge {
         requested.cast<String>(),
       );
     }
-    final handler = bloc.editorController.toolCubit.getHandler();
-    if (handler is! SelectHandler) return [];
-    return handler.selectedRenderers
-        .where((renderer) => renderer.element is PenElement)
-        .toList();
+    return actual;
   }
 
   Rect _bounds(List<Renderer<PadElement>> selected) {
@@ -489,7 +639,54 @@ class MathInkEmbedBridge {
           'fingerWriting': true,
           'stablePageIds': true,
           'operationIdempotency': true,
+          'selection': true,
+          'selectionTransform': true,
         };
+      case 'getSelection':
+        _bindSelectionNote(payload);
+        await _waitRenderers();
+        final activeHandler = bloc.editorController.toolCubit.getHandler();
+        if (activeHandler is SelectHandler) _observeSelection(activeHandler);
+        return _selectionState();
+      case 'selectAll':
+        {
+          _bindSelectionNote(payload);
+          await _waitRenderers();
+          var handler = bloc.editorController.toolCubit.getHandler();
+          if (handler is! SelectHandler) {
+            handler = SelectHandler(
+              SelectTool(mode: .lasso),
+              hostManaged: true,
+            );
+            await bloc.editorController.toolCubit.changeTool(
+              bloc.editorController,
+              bloc,
+              handler: handler,
+            );
+          }
+          final selection = handler;
+          _observeSelection(selection);
+          selection.selectAll(
+            bloc,
+            (renderer) => !_state.invisibleLayers.contains(renderer.layer),
+          );
+          return _selectionState();
+        }
+      case 'clearSelection':
+        {
+          _bindSelectionNote(payload);
+          final selection = _selectionState();
+          if (payload['pageId'] != null &&
+                  payload['pageId'] != selection['pageId'] ||
+              payload['generation'] != null &&
+                  payload['generation'] != selection['generation']) {
+            return {...selection, 'cleared': false};
+          }
+          final handler = bloc.editorController.toolCubit.getHandler();
+          if (handler is SelectHandler) handler.clearSelection(bloc);
+          _emitSelection();
+          return {..._selectionState(), 'cleared': true};
+        }
       case 'listPages':
         {
           await _ensureIds();
@@ -752,6 +949,7 @@ class MathInkEmbedBridge {
         return _view();
       case 'setTool':
         {
+          _bindSelectionNote(payload);
           final name = payload['tool'];
           final width = payload['width'] as num? ?? 3;
           if (!width.isFinite || width < .1 || width > 100) {
@@ -778,12 +976,24 @@ class MathInkEmbedBridge {
             'pan' => HandTool(),
             _ => throw const FormatException('UNSUPPORTED_TOOL'),
           };
-          await bloc.editorController.toolCubit.changeTool(
-            bloc.editorController,
-            bloc,
-            handler: Handler.fromTool(tool),
-          );
           final controller = bloc.editorController;
+          final previous = controller.toolCubit.getHandler();
+          if (name == 'lasso' &&
+              previous is SelectHandler &&
+              previous.data.mode == .lasso) {
+            _observeSelection(previous);
+          } else {
+            if (previous is SelectHandler) previous.clearSelection(bloc);
+            final next = name == 'lasso'
+                ? SelectHandler(tool as SelectTool, hostManaged: true)
+                : Handler.fromTool(tool);
+            if (next is SelectHandler) _observeSelection(next);
+            await controller.toolCubit.changeTool(
+              controller,
+              bloc,
+              handler: next,
+            );
+          }
           final input = controller.inputCubit;
           if (controller.saveCubit.state.embedding?.fullScreen.queryValue ==
                   'forced' &&
@@ -793,6 +1003,7 @@ class MathInkEmbedBridge {
             if (input.state.hideUi == .touch) input.exitHideUI();
             input.toggleKeyboardHideUI();
           }
+          _emitSelection();
           return {'tool': name};
         }
       case 'setFingerWriting':
@@ -816,13 +1027,23 @@ class MathInkEmbedBridge {
       case 'undo':
       case 'redo':
         {
+          final before = await _state.saveData();
+          final beforePage = _pageId(_state);
           if (method == 'undo') {
             bloc.sendUndo();
           } else {
             bloc.sendRedo();
           }
           await _waitRenderers();
-          return _pageState();
+          final after = await _state.saveData();
+          final affected = mathInkAffectedPages(before, after);
+          if (beforePage != _pageId(_state)) {
+            for (final id in [beforePage, _pageId(_state)]) {
+              if (!affected.contains(id)) affected.add(id);
+            }
+          }
+          _emitSelection();
+          return {..._pageState(), 'affectedPageIds': affected};
         }
       case 'renderPage':
         {
@@ -893,24 +1114,27 @@ class MathInkEmbedBridge {
           };
         }
       case 'getSelectedInk':
-        final selected = _selection(state, payload);
-        return _source(state, selected, _bounds(selected));
+        await _waitRenderers();
+        final selected = _selection(_state, payload);
+        return _source(_state, selected, _bounds(selected));
       case 'renderSelectedInk':
-        final selected = _selection(state, payload);
+        await _waitRenderers();
+        final active = _state;
+        final selected = _selection(active, payload);
         final bounds = _bounds(selected);
-        final source = _source(state, selected, bounds);
+        final source = _source(active, selected, bounds);
         final png = await bloc.editorController.rendererCubit.render(
           bloc.editorController,
-          state.data,
-          state.page,
-          state.info,
+          active.data,
+          active.page,
+          active.info,
           mathInkImageOptions(bounds),
           cameraViewport: CameraViewport.unbaked(
             unbakedElements: selected,
             visibleElements: selected,
             visibleUnbakedElements: selected,
           ),
-          docState: state,
+          docState: active,
         );
         if (png == null) throw const FormatException('RENDER_FAILED');
         return {
@@ -974,6 +1198,7 @@ class MathInkEmbedBridge {
                 active.page.extra['mathinkOperations'] as Map,
               )
             : <String, dynamic>{};
+        operations.addAll(_operationReceipts[_pageId(active)] ?? {});
         final receipt = operations[operationId];
         if (operationId != null && receipt is Map) {
           if (receipt['signature'] != signature) {
@@ -1011,27 +1236,13 @@ class MathInkEmbedBridge {
           if (operations.length >= 10000) {
             throw const FormatException('OPERATION_HISTORY_FULL');
           }
-          // Keep the receipt in the pre-insertion history state. Native undo
-          // removes the instance, never the consumed operation identity.
+          // Consume once, including after undo. getDocument merges this table
+          // into the exported copy without adding a second native history row.
           operations[operationId] = {'elementId': id, 'signature': signature};
           _operationReceipts.putIfAbsent(
             _pageId(active),
             () => {},
           )[operationId as String] = operations[operationId];
-          final saved = await active.saveData();
-          await _replaceData(
-            saved
-                .setPage(
-                  active.page.copyWith(
-                    extra: {
-                      ...active.page.extra,
-                      'mathinkOperations': operations,
-                    },
-                  ),
-                  active.pageName,
-                )
-                .$1,
-          );
         }
         final completed = bloc.stream.firstWhere(
           (next) =>
@@ -1131,7 +1342,7 @@ class MathInkEmbedBridge {
         {
           await _ensureIds();
           final current = _state;
-          final saved = await current.saveData();
+          final saved = await _savedDocument();
           return {
             'data': saved.exportAsBytes().toList(),
             'revision': _revision(current),
@@ -1209,19 +1420,25 @@ class MathInkEmbedBridge {
           0,
         );
         if (controller.saveCubit.state.embedding?.editable != false) {
-          final handler = await controller.toolCubit.changeTool(
-            controller,
-            bloc,
-            handler: SelectHandler(SelectTool()),
-          );
-          if (handler is SelectHandler) {
-            handler.selectAll(
+          var handler = controller.toolCubit.getHandler();
+          if (handler is! SelectHandler || handler.data.mode != .lasso) {
+            handler = SelectHandler(
+              SelectTool(mode: .lasso),
+              hostManaged: true,
+            );
+            await controller.toolCubit.changeTool(
+              controller,
               bloc,
-              (renderer) =>
-                  renderer.element is PenElement &&
-                  ids.contains(renderer.element.id),
+              handler: handler,
             );
           }
+          _observeSelection(handler);
+          handler.selectAll(
+            bloc,
+            (renderer) =>
+                renderer.element is PenElement &&
+                ids.contains(renderer.element.id),
+          );
         }
         return {
           'page': page,
@@ -1265,6 +1482,16 @@ class MathInkEmbedBridge {
   }
 
   void register() {
+    _toolSubscription ??= bloc.editorController.toolCubit.stream.listen((_) {
+      final handler = bloc.editorController.toolCubit.getHandler();
+      if (handler is SelectHandler) {
+        _observeSelection(handler);
+      } else {
+        _observedSelection?.mathInkSelectionChanged = null;
+        _observedSelection = null;
+      }
+      _emitSelection();
+    });
     _listener ??= onEmbedMessage('mathink', (message) async {
       String? requestId;
       String? method;
@@ -1295,6 +1522,11 @@ class MathInkEmbedBridge {
   }
 
   void unregister() {
+    _toolSubscription?.cancel();
+    _toolSubscription = null;
+    _observedSelection?.mathInkSelectionChanged = null;
+    _observedSelection = null;
+    _operationReceipts.clear();
     if (_listener != null) removeEmbedMessageListener(_listener!);
     _listener = null;
   }

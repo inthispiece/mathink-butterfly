@@ -71,7 +71,8 @@ class _LoadedViewport extends StatelessWidget {
         onPointerDown: (event) => input.handlePointerDown(event, pointerInput),
         onPointerMove: (event) => input.handlePointerMove(event, pointerInput),
         onPointerUp: (event) => input.handlePointerUp(event, pointerInput),
-        onPointerCancel: (event) => input.handlePointerCancel(event, cubit),
+        onPointerCancel: (event) =>
+            input.handlePointerCancel(event, pointerInput),
         onPointerHover: (event) {
           cubit.inputCubit.updateLastPosition(event.localPosition);
           getHandler().onPointerHover(event, getEventContext());

@@ -1,7 +1,11 @@
 part of 'handler.dart';
 
 class SelectHandler extends Handler<SelectTool> {
-  final _selectionManager = RectSelectionForegroundManager();
+  final RectSelectionForegroundManager _selectionManager;
+  final bool hostManaged;
+  VoidCallback? mathInkSelectionChanged;
+  int _interactionGeneration = 0;
+  bool _cancelledGesture = false;
   List<Renderer<PadElement>> _selected = [];
   bool _duplicate = false;
   Offset? _rectangleFreeSelectionStart;
@@ -10,12 +14,18 @@ class SelectHandler extends Handler<SelectTool> {
   List<Offset>? _lassoFreeSelection;
   ({Offset position, SelectionTransformCorner? corner})? _pendingTransform;
 
-  SelectHandler(super.data);
+  SelectHandler(super.data, {this.hostManaged = false})
+    : _selectionManager = RectSelectionForegroundManager(
+        enableRotation: !hostManaged,
+        forceProportional: hostManaged,
+      );
 
   /// Read-only snapshot for the MathInk embed bridge. Keeping the renderer list
   /// private prevents a host from modifying the selection behind the tool.
   List<Renderer<PadElement>> get selectedRenderers =>
       List.unmodifiable(_selected);
+
+  int get selectionEpoch => _interactionGeneration;
 
   void transform(
     DocumentBloc bloc,
@@ -26,6 +36,23 @@ class SelectHandler extends Handler<SelectTool> {
   }) {
     _selected = next ?? _selected;
     _submitTransform(bloc);
+    if (hostManaged) {
+      var minimum = .05, maximum = 20.0;
+      for (final renderer in _selected) {
+        final element = renderer.element;
+        if (element is MarkdownElement && element.extra['mathink'] is Map) {
+          minimum = max(minimum, .05 / element.scale);
+          maximum = min(maximum, 20 / element.scale);
+        } else if (element is PenElement && element.property.strokeWidth > 0) {
+          minimum = max(minimum, .1 / element.property.strokeWidth);
+          maximum = min(maximum, 100 / element.property.strokeWidth);
+        }
+      }
+      if (minimum > maximum) return;
+      _selectionManager
+        ..minimumScale = minimum
+        ..maximumScale = maximum;
+    }
     _updateSelectionRect(-bloc.editorController.transformCubit.state.rotation);
     _selectionManager.startTransformWithCorner(corner, position);
     _duplicate = duplicate;
@@ -42,12 +69,15 @@ class SelectHandler extends Handler<SelectTool> {
 
   @override
   Future<void> resetInput(DocumentBloc bloc) async {
-    _submitTransform(bloc);
+    _interactionGeneration++;
+    _cancelledGesture = true;
+    if (!hostManaged) _submitTransform(bloc);
     _rectangleFreeSelectionStart = null;
     _rectangleFreeSelection = null;
     _lassoFreeSelection = null;
     _pendingTransform = null;
     _selectionManager.reset();
+    if (hostManaged) _updateSelectionRect();
     await bloc.refresh(allowBake: false);
   }
 
@@ -67,6 +97,26 @@ class SelectHandler extends Handler<SelectTool> {
         .toList();
     _updateSelectionRect();
     return changed;
+  }
+
+  @override
+  void onDocumentUpdated(
+    DocumentLoadSuccess state,
+    DocumentLoadSuccess? oldState,
+  ) {
+    if (hostManaged &&
+        oldState != null &&
+        oldState.pageName != state.pageName) {
+      _interactionGeneration++;
+      _cancelledGesture = true;
+      _selected.clear();
+      _selectionManager.reset();
+      _rectangleFreeSelection = null;
+      _rectangleFreeSelectionStart = null;
+      _lassoFreeSelection = null;
+      _pendingTransform = null;
+      _updateSelectionRect();
+    }
   }
 
   @override
@@ -119,17 +169,18 @@ class SelectHandler extends Handler<SelectTool> {
     final angle = rotation ?? _selectionManager.rotation;
     Rect? bounds;
     for (final renderer in _selected) {
-      final rect = renderer.rect;
+      // A pen's center line can be empty while its visible stroke is not.
+      final rect = hostManaged ? renderer.expandedRect : renderer.rect;
       if (rect == null) continue;
       for (final corner in rect.toPolygon()) {
-        final point = renderer
-            .transformPoint(corner)
-            .rotate(Offset.zero, -angle);
+        final world = hostManaged ? corner : renderer.transformPoint(corner);
+        final point = world.rotate(Offset.zero, -angle);
         final pointRect = Rect.fromPoints(point, point);
         bounds = bounds?.expandToInclude(pointRect) ?? pointRect;
       }
     }
     _selectionManager.select(bounds, rotation: angle);
+    mathInkSelectionChanged?.call();
   }
 
   void _syncSelectionRotation(CameraTransform camera) {
@@ -155,7 +206,7 @@ class SelectHandler extends Handler<SelectTool> {
 
     final angle = _selectionManager.rotation;
     final transformedPivot = transform.scalePoint(pivot, selectionRect);
-    return _selected.map((renderer) {
+    final result = _selected.map((renderer) {
       final center = (renderer.rect?.center ?? Offset.zero).rotate(
         Offset.zero,
         -angle,
@@ -173,6 +224,22 @@ class SelectHandler extends Handler<SelectTool> {
           ) ??
           renderer;
     }).toList();
+    if (hostManaged &&
+        result.any((renderer) {
+          final bounds = renderer.expandedRect;
+          return bounds == null ||
+              !bounds.left.isFinite ||
+              !bounds.top.isFinite ||
+              !bounds.width.isFinite ||
+              !bounds.height.isFinite ||
+              bounds.left.abs() > 10000000 ||
+              bounds.top.abs() > 10000000 ||
+              bounds.right.abs() > 10000000 ||
+              bounds.bottom.abs() > 10000000;
+        })) {
+      return null;
+    }
+    return result;
   }
 
   @override
@@ -224,7 +291,7 @@ class SelectHandler extends Handler<SelectTool> {
       return [];
     }
 
-    if (state.settingsCubit.state.bringMovedElementsToFront) {
+    if (!hostManaged && state.settingsCubit.state.bringMovedElementsToFront) {
       bloc.add(
         ElementsArranged(Arrangement.front, current.map((e) => e.id).toList()),
       );
@@ -292,12 +359,14 @@ class SelectHandler extends Handler<SelectTool> {
     _selectionManager.resetTransform();
     final settings = context.getSettings();
     final radius = settings.selectSensitivity / transform.size;
+    final generation = ++_interactionGeneration;
     final hits = await context.getDocumentBloc().rayCast(
       globalPos,
       radius,
       useCollection: locks.lockCollection,
       useLayer: locks.lockLayer,
     );
+    if (generation != _interactionGeneration) return;
     if (hits.isEmpty) {
       if (!context.isCtrlPressed) {
         _selected.clear();
@@ -347,12 +416,14 @@ class SelectHandler extends Handler<SelectTool> {
     final state = bloc.state;
     if (state is! DocumentLoadSuccess) return;
     final locks = context.getViewState().locks;
+    final generation = ++_interactionGeneration;
     final hits = await bloc.rayCast(
       position,
       0.0,
       useCollection: locks.lockCollection,
       useLayer: locks.lockLayer,
     );
+    if (generation != _interactionGeneration) return;
     final hit = hits.firstOrNull;
     final rect = hit?.expandedRect;
     final hitSelection = _isSelectionHit(
@@ -364,6 +435,7 @@ class SelectHandler extends Handler<SelectTool> {
       _selected.clear();
       if (hit != null) _selected.add(hit);
     }
+    _updateSelectionRect();
     context.refresh();
     final buildContext = context.buildContext;
     if (buildContext.mounted) {
@@ -381,8 +453,8 @@ class SelectHandler extends Handler<SelectTool> {
           getSelectionRect(),
         ),
       );
-      if (result ?? false) {
-        _selected.clear();
+      if ((result ?? false) && generation == _interactionGeneration) {
+        clearSelection(bloc);
       }
     }
     context.refresh();
@@ -390,6 +462,8 @@ class SelectHandler extends Handler<SelectTool> {
 
   @override
   bool onScaleStart(ScaleStartDetails details, EventContext context) {
+    _interactionGeneration++;
+    _cancelledGesture = false;
     final pendingTransform = _pendingTransform;
     _pendingTransform = null;
     final toolState = context.getToolState();
@@ -466,8 +540,8 @@ class SelectHandler extends Handler<SelectTool> {
     if (details.pointerCount > 1) return;
     if (_selectionManager.isTransforming) {
       _selectionManager.updateModifiers(
-        proportional: context.isShiftPressed,
-        centered: context.isAltPressed,
+        proportional: hostManaged || context.isShiftPressed,
+        centered: !hostManaged && context.isAltPressed,
       );
       _selectionManager.updateCurrentPosition(globalPos);
       context.refreshForegrounds();
@@ -495,11 +569,20 @@ class SelectHandler extends Handler<SelectTool> {
 
   @override
   void dispose(DocumentBloc bloc) {
-    _submitTransform(bloc);
+    if (hostManaged) {
+      cancelTransform(bloc);
+    } else {
+      _submitTransform(bloc);
+    }
   }
 
   @override
   Future<void> onScaleEnd(ScaleEndDetails details, EventContext context) async {
+    if (_cancelledGesture) {
+      _cancelledGesture = false;
+      return;
+    }
+    final generation = _interactionGeneration;
     _pendingTransform = null;
     final locks = context.getViewState().locks;
     final rectangleSelection = _rectangleFreeSelection;
@@ -525,6 +608,7 @@ class SelectHandler extends Handler<SelectTool> {
         useLayer: locks.lockLayer,
         hitElementMode: data.hitElementMode,
       );
+      if (generation != _interactionGeneration) return;
       _selected.addAll(hits);
     } else if (lassoSelection != null && lassoSelection.isNotEmpty) {
       final hits = await context.getDocumentBloc().rayCastPolygon(
@@ -533,6 +617,7 @@ class SelectHandler extends Handler<SelectTool> {
         useLayer: locks.lockLayer,
         hitElementMode: data.hitElementMode,
       );
+      if (generation != _interactionGeneration) return;
       _selected.addAll(hits);
     } else {
       _updateSelectionRect();
@@ -603,8 +688,7 @@ class SelectHandler extends Handler<SelectTool> {
         ),
       ),
     );
-    _selected.clear();
-    bloc.refresh();
+    clearSelection(bloc);
   }
 
   void selectAll(
@@ -613,6 +697,7 @@ class SelectHandler extends Handler<SelectTool> {
   ]) {
     final state = bloc.state;
     if (state is! DocumentLoadSuccess) return;
+    cancelTransform(bloc);
     _selected.clear();
     _selected.addAll(
       bloc.editorController.rendererCubit.renderers.where(
@@ -630,6 +715,9 @@ class SelectHandler extends Handler<SelectTool> {
 
     return {
       ...super.getActions(context),
+      ExitIntent: CallbackAction<ExitIntent>(
+        onInvoke: (intent) => clearSelection(bloc),
+      ),
       SelectAllTextIntent: CallbackAction<SelectAllTextIntent>(
         onInvoke: (intent) => selectAll(bloc),
       ),
@@ -642,8 +730,7 @@ class SelectHandler extends Handler<SelectTool> {
               _selected.map((r) => r.element.id).nonNulls.toList(),
             ),
           );
-          _selected.clear();
-          bloc.refreshForegrounds();
+          clearSelection(bloc);
           return null;
         },
       ),
@@ -657,8 +744,20 @@ class SelectHandler extends Handler<SelectTool> {
   }
 
   void clearSelection(DocumentBloc bloc) {
-    _selected.clear();
+    cancelTransform(bloc, clear: true);
+  }
+
+  /// Cancel previews without submitting a half gesture into native history.
+  void cancelTransform(DocumentBloc bloc, {bool clear = false}) {
+    _interactionGeneration++;
+    _cancelledGesture = true;
+    _selectionManager.reset();
+    _pendingTransform = null;
+    _rectangleFreeSelectionStart = null;
+    _rectangleFreeSelection = null;
+    _lassoFreeSelection = null;
+    if (clear) _selected.clear();
     _updateSelectionRect();
-    bloc.refreshForegrounds();
+    unawaited(bloc.refresh(allowBake: false));
   }
 }

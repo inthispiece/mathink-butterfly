@@ -2131,6 +2131,8 @@ class DocumentBloc extends ReplayBloc<DocumentEvent, DocumentState> {
   }
 
   void sendUndo() {
+    final handler = _editorController?.toolCubit.getHandler();
+    if (handler is SelectHandler) handler.clearSelection(this);
     if (!(networkingService?.sendUndo() ?? false)) {
       undo();
       _scheduleHistoryReload();
@@ -2138,6 +2140,8 @@ class DocumentBloc extends ReplayBloc<DocumentEvent, DocumentState> {
   }
 
   void sendRedo() {
+    final handler = _editorController?.toolCubit.getHandler();
+    if (handler is SelectHandler) handler.clearSelection(this);
     if (!(networkingService?.sendRedo() ?? false)) {
       redo();
       _scheduleHistoryReload();

@@ -335,6 +335,10 @@ class PenRenderer extends Renderer<PenElement> {
       rotation: rotation,
       shear: shear,
       points: movePoints(position, scaleX, scaleY),
+      property: element.property.copyWith(
+        strokeWidth:
+            element.property.strokeWidth * sqrt((scaleX * scaleY).abs()),
+      ),
     ),
     layer,
     moveRect(position, scaleX, scaleY),

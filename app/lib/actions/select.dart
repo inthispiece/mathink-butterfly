@@ -27,12 +27,23 @@ class SelectAllAction extends Action<SelectAllIntent> {
   @override
   Future<void> invoke(SelectAllIntent intent) async {
     final cubit = context.read<EditorController>();
-    if (cubit.toolCubit.getHandler(
+    final bloc = context.read<DocumentBloc>();
+    final active = cubit.toolCubit.getHandler(
       editable: cubit.saveCubit.state.embedding?.editable != false,
-    ) is SelectHandler) {
+    );
+    if (active is SelectHandler) {
+      active.selectAll(bloc);
       return;
     }
-    final bloc = context.read<DocumentBloc>();
+    if (cubit.saveCubit.state.embedding?.fullScreen.queryValue == 'forced') {
+      final handler = SelectHandler(
+        SelectTool(mode: .lasso),
+        hostManaged: true,
+      );
+      await cubit.toolCubit.changeTool(cubit, bloc, handler: handler);
+      handler.selectAll(bloc);
+      return;
+    }
     final handler = await cubit.toolCubit.changeTemporaryHandler(
       context,
       cubit,
